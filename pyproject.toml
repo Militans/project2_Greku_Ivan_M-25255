@@ -7,7 +7,8 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "prompt (>=0.4.1,<0.5.0)"
+    "prompt (>=0.4.1,<0.5.0)",
+    "prettytable (>=3.17.0,<4.0.0)"
 ]
 
 
