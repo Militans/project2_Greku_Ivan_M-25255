@@ -1,8 +1,9 @@
 import json
-from json import JSONDecodeError
 import os
+from json import JSONDecodeError
 
-from .constants import TABLE_FILE_TEMPLATE, DATA_DIR
+from .constants import DATA_DIR, TABLE_FILE_TEMPLATE
+
 
 def _ensure_data_dir() -> None:
     """Создает директорию data/, если ее нет."""
