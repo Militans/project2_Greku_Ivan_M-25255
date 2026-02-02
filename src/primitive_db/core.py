@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 
 from .constants import RESERVED_ID_COLUMN, SUPPORTED_TYPES
+from .decorators import confirm_action, handle_db_errors, log_time
 
 
 @dataclass(frozen=True)
-class InvalidValueError(Exception):
+class InvalidValueError(ValueError):
     """
     Недопустимое значение, введенное пользователем
 
@@ -13,19 +14,19 @@ class InvalidValueError(Exception):
     value: str
 
 
-class TableAlreadyExistsError(Exception):
+class TableAlreadyExistsError(KeyError):
     """
     Ошибка, возникающая при создании существующей таблицы
     """
 
 
-class TableDoesNotExistError(Exception):
+class TableDoesNotExistError(KeyError):
     """
     Ошибка, возникающая при обращении к несуществующей таблице
     """
 
 
-class TableSchemaError(Exception):
+class TableSchemaError(ValueError):
     """
     Ошибка схемы таблицы
     """
@@ -96,7 +97,7 @@ def _parse_column_type(column_token: str) -> tuple:
     if not name or not col_type:
         raise InvalidValueError(column_token)
 
-    if name == RESERVED_ID_COLUMN:
+    if name.lower() == RESERVED_ID_COLUMN.lower():
         raise InvalidValueError(name)
 
     if col_type not in SUPPORTED_TYPES:
@@ -105,6 +106,7 @@ def _parse_column_type(column_token: str) -> tuple:
     return name, col_type
 
 
+@handle_db_errors
 def create_table(metadata: dict, table_name: str, columns: list) -> dict:
     """
     Создание новой таблицы и сохранение ее схемы в метаданных
@@ -112,19 +114,21 @@ def create_table(metadata: dict, table_name: str, columns: list) -> dict:
     :param metadata: Метаданные бд
     :param table_name: Название таблицы
     :param columns: Колонки таблицы
-    :return: Загрузка данных таблицы в метаданные бд
+    :return: dict: Обновленные метаданные бд
     :raises: TableAlreadyExistsError: Если таблица существует
     :raises: InvalidValueError: Если название таблицы или колонок недопустимы
     """
-    table_name = table_name.strip()
+    if not isinstance(metadata, dict):
+        raise InvalidValueError("<metadata>")
 
+    table_name = table_name.strip()
     if not table_name:
         raise InvalidValueError(table_name)
 
     if table_name in metadata:
         raise TableAlreadyExistsError(table_name)
 
-    if not columns:
+    if not isinstance(columns, list) or not columns:
         raise InvalidValueError("<columns>")
 
     parsed_columns = [{"name": RESERVED_ID_COLUMN, "type": "int"}]
@@ -138,12 +142,15 @@ def create_table(metadata: dict, table_name: str, columns: list) -> dict:
 
         seen_columns.add(column_name)
         parsed_columns.append({"name": column_name, "type": column_type})
+
     new_metadata = dict(metadata)
     new_metadata[table_name] = {"columns": parsed_columns}
 
     return new_metadata
 
 
+@handle_db_errors
+@confirm_action("удаление таблицы")
 def drop_table(metadata: dict, table_name: str) -> dict:
     """
     Удаление таблицы из метаданных
@@ -153,7 +160,6 @@ def drop_table(metadata: dict, table_name: str) -> dict:
     :return: dict: Обновленные метаданные бд
     :raises: TableDoesNotExistError: Если таблицы не существует
     """
-
     table_name = table_name.strip()
     if table_name not in metadata:
         raise TableDoesNotExistError(table_name)
@@ -163,6 +169,7 @@ def drop_table(metadata: dict, table_name: str) -> dict:
     return new_metadata
 
 
+@handle_db_errors
 def list_tables(metadata: dict) -> list:
     """
     Отображение списка существующих таблиц
@@ -170,9 +177,14 @@ def list_tables(metadata: dict) -> list:
     :param metadata: Метаданные бд
     :return: list: Список имен таблиц
     """
+    if not isinstance(metadata, dict):
+        raise InvalidValueError("<metadata>")
+
     return sorted(metadata.keys())
 
 
+@handle_db_errors
+@log_time
 def insert(metadata: dict, table_name: str, table_data: list, values: list) -> tuple:
     """
     Добавление записи в таблицу
@@ -208,6 +220,8 @@ def insert(metadata: dict, table_name: str, table_data: list, values: list) -> t
     return table_data, new_id
 
 
+@handle_db_errors
+@log_time
 def select(table_data: list, where_clause: dict | None = None) -> list:
     """
     Получение записей из таблицы
@@ -215,14 +229,19 @@ def select(table_data: list, where_clause: dict | None = None) -> list:
     :param table_data: Данные таблицы
     :param where_clause: Условие where (опционально)
     :return: list: Список записей
+    :raises: InvalidValueError: Если where некорректен
     """
-    if not where_clause:
+    if where_clause is None or where_clause == {}:
         return list(table_data)
+
+    if not isinstance(where_clause, dict) or len(where_clause) != 1:
+        raise InvalidValueError("<where>")
 
     (key, value), = where_clause.items()
     return [row for row in table_data if row.get(key) == value]
 
 
+@handle_db_errors
 def update(
     metadata: dict,
     table_name: str,
@@ -245,6 +264,12 @@ def update(
     schema = _get_schema(metadata, table_name)
     types_map = {c["name"]: c["type"] for c in schema}
 
+    if not isinstance(set_clause, dict) or not set_clause:
+        raise InvalidValueError("<set>")
+
+    if not isinstance(where_clause, dict) or len(where_clause) != 1:
+        raise InvalidValueError("<where>")
+
     if "ID" in set_clause:
         raise InvalidValueError("ID")
 
@@ -262,6 +287,8 @@ def update(
     return table_data, updated
 
 
+@handle_db_errors
+@confirm_action("удаление записи")
 def delete(table_data: list, where_clause: dict) -> tuple:
     """
     Удаление записей по условию
@@ -269,7 +296,11 @@ def delete(table_data: list, where_clause: dict) -> tuple:
     :param table_data: Данные таблицы
     :param where_clause: Условие where
     :return: tuple: (Обновленные данные, количество удаленных записей)
+    :raises: InvalidValueError: Если where некорректен
     """
+    if not isinstance(where_clause, dict) or len(where_clause) != 1:
+        raise InvalidValueError("<where>")
+
     (key, value), = where_clause.items()
 
     before = len(table_data)
@@ -279,6 +310,7 @@ def delete(table_data: list, where_clause: dict) -> tuple:
     return new_data, deleted
 
 
+@handle_db_errors
 def info(metadata: dict, table_name: str, table_data: list) -> dict:
     """
     Получение информации о таблице

@@ -1,14 +1,12 @@
+import os
 import re
 import shlex
 
 import prompt
 from prettytable import PrettyTable
 
-from .constants import METADATA_PATH
+from .constants import METADATA_PATH, TABLE_FILE_TEMPLATE
 from .core import (
-    InvalidValueError,
-    TableAlreadyExistsError,
-    TableDoesNotExistError,
     create_table,
     delete,
     drop_table,
@@ -18,44 +16,55 @@ from .core import (
     select,
     update,
 )
+from .decorators import create_cacher
 from .parser import parse_set, parse_values, parse_where
 from .utils import load_metadata, load_table_data, save_metadata, save_table_data
+
+_CACHE_SELECT = create_cacher()
 
 
 def print_help() -> None:
     """
-    Вывод справочной информации по доступным командам
+    Вывод справки по доступным командам.
 
     :return: None
     """
-    print("\n***Управление таблицами***")
+    print("\n***База данных***")
     print("Функции:")
-    print("<command> create_table <имя_таблицы> <столбец1:тип> .. - создать таблицу")
-    print("<command> list_tables - показать список всех таблиц")
-    print("<command> drop_table <имя_таблицы> - удалить таблицу")
-
-    print("\n***Операции с данными***")
-    print("Функции:")
-    print('<command> insert into <таблица> values ("str", 1, true) - создать запись')
-    print("<command> select from <таблица> - прочитать все записи")
-    print(
-        "<command> select from <таблица> where <столбец> = <значение> - фильтрация"
-    )
-    print(
-        "<command> update <таблица> set <столбец> = <значение> "
-        "where <столбец> = <значение> - обновить"
-    )
-    print("<command> delete from <таблица> where <столбец> = <значение> - удалить")
+    print("<command> create_table <таблица> <столбец:тип> ... - создать таблицу")
+    print("<command> list_tables - показать список таблиц")
+    print("<command> drop_table <таблица> - удалить таблицу")
+    print("<command> insert into <таблица> values (...) - добавить запись")
+    print("<command> select from <таблица> - вывести все записи")
+    print("<command> select from <таблица> where a = b - фильтрация")
+    print("<command> update <таблица> set a = b where c = d - обновить")
+    print("<command> delete from <таблица> where a = b - удалить")
     print("<command> info <таблица> - информация о таблице")
+    print("<command> exit - выход")
+    print("<command> help - справка\n")
 
-    print("\n***Общие команды***")
-    print("<command> exit - выход из программы")
-    print("<command> help - справочная информация\n")
+
+def _render_table(schema: list, rows: list) -> None:
+    """
+    Печать выборки в формате PrettyTable.
+
+    :param schema: схема таблицы (список колонок)
+    :param rows: строки (список словарей)
+    :return: None
+    """
+    headers = [c["name"] for c in schema]
+    pt = PrettyTable()
+    pt.field_names = headers
+
+    for row in rows:
+        pt.add_row([row.get(h) for h in headers])
+
+    print(pt)
 
 
 def run() -> None:
     """
-    Главый цикл программы
+    Главный цикл CLI базы данных.
 
     :return: None
     """
@@ -63,73 +72,67 @@ def run() -> None:
 
     while True:
         user_input = prompt.string("Введите команду: ").strip()
-
         if not user_input:
             continue
 
         raw = user_input.strip()
 
         m = re.fullmatch(
-            r'insert\s+into\s+(\w+)\s+values\s*\((.*)\)\s*',
+            r"insert\s+into\s+(\w+)\s+values\s*\((.*)\)\s*",
             raw,
             flags=re.IGNORECASE,
         )
-
         if m:
             table = m.group(1)
             values_inner = m.group(2)
+
             metadata = load_metadata(METADATA_PATH)
             table_data = load_table_data(table)
-
             values = parse_values(values_inner)
-            try:
-                table_data, new_id = insert(metadata, table, table_data, values)
-            except (TableDoesNotExistError, InvalidValueError) as e:
-                bad_value = getattr(e, "value", str(e))
-                print(f"Некорректное значение: {bad_value}. Попробуйте снова.")
+
+            result = insert(metadata, table, table_data, values)
+            if result is None:
                 continue
 
+            table_data, new_id = result
             save_table_data(table, table_data)
             print(f'Запись с ID={new_id} успешно добавлена в таблицу "{table}".')
             continue
 
         m = re.fullmatch(
-            r'select\s+from\s+(\w+)(?:\s+where\s+(.+))?\s*',
+            r"select\s+from\s+(\w+)(?:\s+where\s+(.+))?\s*",
             raw,
             flags=re.IGNORECASE,
         )
-
         if m:
             table = m.group(1)
             where_raw = m.group(2)
 
             metadata = load_metadata(METADATA_PATH)
-            _ = metadata.get(table)
             if table not in metadata:
                 print(f'Ошибка: Таблица "{table}" не существует.')
                 continue
 
             table_data = load_table_data(table)
             where_clause = parse_where(where_raw) if where_raw else None
-            rows = select(table_data, where_clause)
+
+            filepath = TABLE_FILE_TEMPLATE.format(table=table)
+            mtime = os.path.getmtime(filepath) if os.path.exists(filepath) else 0.0
+            key = (table, where_raw or "", mtime)
+
+            rows = _CACHE_SELECT(key, lambda: select(table_data, where_clause))
+            if rows is None:
+                continue
 
             schema = metadata[table]["columns"]
-            headers = [c["name"] for c in schema]
-
-            pt = PrettyTable()
-            pt.field_names = headers
-            for r in rows:
-                pt.add_row([r.get(h) for h in headers])
-
-            print(pt)
+            _render_table(schema, rows)
             continue
 
         m = re.fullmatch(
-            r'update\s+(\w+)\s+set\s+(.+?)\s+where\s+(.+)\s*',
+            r"update\s+(\w+)\s+set\s+(.+?)\s+where\s+(.+)\s*",
             raw,
             flags=re.IGNORECASE,
         )
-
         if m:
             table = m.group(1)
             set_raw = m.group(2)
@@ -141,36 +144,31 @@ def run() -> None:
                 continue
 
             table_data = load_table_data(table)
-            try:
-                set_clause = parse_set(set_raw)
-                where_clause = parse_where(where_raw)
-                table_data, updated = update(
-                    metadata,
-                    table,
-                    table_data,
-                    set_clause,
-                    where_clause,
-                )
-            except InvalidValueError as e:
-                print(f"Некорректное значение: {e.value}. Попробуйте снова.")
+            set_clause = parse_set(set_raw)
+            where_clause = parse_where(where_raw)
+
+            result = update(metadata, table, table_data, set_clause, where_clause)
+            if result is None:
                 continue
 
+            table_data, updated = result
             save_table_data(table, table_data)
+
             if updated == 0:
                 print("Ничего не обновлено (нет подходящих записей).")
             else:
-                print(
+                msg = (
                     f'Записи в таблице "{table}" успешно обновлены. '
-                    f'Изменено: {updated}.'
+                    f"Изменено: {updated}."
                 )
+                print(msg)
             continue
 
         m = re.fullmatch(
-            r'delete\s+from\s+(\w+)\s+where\s+(.+)\s*',
+            r"delete\s+from\s+(\w+)\s+where\s+(.+)\s*",
             raw,
             flags=re.IGNORECASE,
         )
-
         if m:
             table = m.group(1)
             where_raw = m.group(2)
@@ -182,15 +180,20 @@ def run() -> None:
 
             table_data = load_table_data(table)
             where_clause = parse_where(where_raw)
-            table_data, deleted = delete(table_data, where_clause)
 
+            result = delete(table_data, where_clause)
+            if result is None:
+                continue
+
+            table_data, deleted = result
             save_table_data(table, table_data)
-            print(f'Удалено записей: {deleted}.')
+            print(f"Удалено записей: {deleted}.")
             continue
 
-        m = re.fullmatch(r'info\s+(\w+)\s*', raw, flags=re.IGNORECASE)
+        m = re.fullmatch(r"info\s+(\w+)\s*", raw, flags=re.IGNORECASE)
         if m:
             table = m.group(1)
+
             metadata = load_metadata(METADATA_PATH)
             if table not in metadata:
                 print(f'Ошибка: Таблица "{table}" не существует.')
@@ -198,6 +201,9 @@ def run() -> None:
 
             table_data = load_table_data(table)
             res = info(metadata, table, table_data)
+            if res is None:
+                continue
+
             print(f'Таблица: {res["table"]}')
             print(f'Столбцы: {res["columns"]}')
             print(f'Количество записей: {res["count"]}')
@@ -206,15 +212,14 @@ def run() -> None:
         try:
             args = shlex.split(user_input)
         except ValueError:
-            print("Некорректное значение <input>. Попробуйте снова")
+            print("Некорректное значение <input>. Попробуйте снова.")
+            continue
+
+        if not args:
             continue
 
         command = args[0]
         cmd_args = args[1:]
-
-        command = args[0]
-        cmd_args = args[1:]
-
         metadata = load_metadata(METADATA_PATH)
 
         match command:
@@ -226,6 +231,8 @@ def run() -> None:
 
             case "list_tables":
                 tables = list_tables(metadata)
+                if tables is None:
+                    continue
                 if not tables:
                     print("- (нет таблиц)")
                 else:
@@ -240,24 +247,17 @@ def run() -> None:
                 table_name = cmd_args[0]
                 columns = cmd_args[1:]
 
-                try:
-                    new_metadata = create_table(metadata, table_name, columns)
-                except TableAlreadyExistsError as e:
-                    print(f"Ошибка: {e}")
-                    continue
-                except InvalidValueError as e:
-                    print(f"Некорректное значение: {e.value}. Попробуйте снова.")
+                new_metadata = create_table(metadata, table_name, columns)
+                if new_metadata is None:
                     continue
 
                 save_metadata(METADATA_PATH, new_metadata)
-
                 cols = new_metadata[table_name]["columns"]
-                cols_text = ", ".join(
-                    [f'{c["name"]}:{c["type"]}' for c in cols]
-                )
+                cols_text = ", ".join([f'{c["name"]}:{c["type"]}' for c in cols])
+
                 print(
                     f'Таблица "{table_name}" успешно создана со столбцами: '
-                    f'{cols_text}'
+                    f"{cols_text}"
                 )
 
             case "drop_table":
@@ -267,13 +267,16 @@ def run() -> None:
 
                 table_name = cmd_args[0]
 
-                try:
-                    new_metadata = drop_table(metadata, table_name)
-                except TableDoesNotExistError as e:
-                    print(f"Ошибка: {e}")
+                new_metadata = drop_table(metadata, table_name)
+                if new_metadata is None:
                     continue
 
                 save_metadata(METADATA_PATH, new_metadata)
+
+                filepath = TABLE_FILE_TEMPLATE.format(table=table_name)
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
                 print(f'Таблица "{table_name}" успешно удалена.')
 
             case _:
